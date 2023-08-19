@@ -32,9 +32,9 @@ train_percent       = 0.9
 #   指向VOC数据集所在的文件夹
 #   默认指向根目录下的VOC数据集
 #-------------------------------------------------------#
-VOCdevkit_path  = 'VOCdevkit'
+VOCdevkit_path  = 'VOCdevkit/VOCdevkit'
 
-VOCdevkit_sets  = [('2007', 'train'), ('2007', 'val')]
+VOCdevkit_sets  = [('2012', 'train'), ('2012', 'val')]
 classes, _      = get_classes(classes_path)
 
 #-------------------------------------------------------#
@@ -68,8 +68,8 @@ if __name__ == "__main__":
 
     if annotation_mode == 0 or annotation_mode == 1:
         print("Generate txt in ImageSets.")
-        xmlfilepath     = os.path.join(VOCdevkit_path, 'VOC2007/Annotations')
-        saveBasePath    = os.path.join(VOCdevkit_path, 'VOC2007/ImageSets/Main')
+        xmlfilepath     = os.path.join(VOCdevkit_path, 'VOC2012/Annotations')
+        saveBasePath    = os.path.join(VOCdevkit_path, 'VOC2012/ImageSets/Main')
         temp_xml        = os.listdir(xmlfilepath)
         total_xml       = []
         for xml in temp_xml:

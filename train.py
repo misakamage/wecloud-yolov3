@@ -1,17 +1,29 @@
 #-------------------------------------#
 #       对数据集进行训练
 #-------------------------------------#
-import datetime
+from datetime import datetime
+import logging
 import os
+import time
 
+import sys
+import subprocess
+import argparse
+
+import re
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
+import torchvision.datasets as datasets
 from torch import nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from utils.utils import get_lr
+
 
 from nets.yolo import YoloBody
 from nets.yolo_training import (YOLOLoss, get_lr_scheduler, set_optimizer_lr,
@@ -19,7 +31,8 @@ from nets.yolo_training import (YOLOLoss, get_lr_scheduler, set_optimizer_lr,
 from utils.callbacks import LossHistory, EvalCallback
 from utils.dataloader import YoloDataset, yolo_dataset_collate
 from utils.utils import get_anchors, get_classes, show_config
-from utils.utils_fit import fit_one_epoch
+from utils.utils_map import get_map
+
 
 '''
 训练自己的目标检测模型一定需要注意以下几点：
@@ -36,13 +49,114 @@ from utils.utils_fit import fit_one_epoch
    
 3、训练好的权值文件保存在logs文件夹中，每个训练世代（Epoch）包含若干训练步长（Step），每个训练步长（Step）进行一次梯度下降。
    如果只是训练了几个Step是不会保存的，Epoch和Step的概念要捋清楚一下。
-'''
+
+   '''
+def most_recent_folder(net_weights, fmt):
+    """
+        return most recent created folder under net_weights
+        if no none-empty folder were found, return empty folder
+    """
+    # get subfolders in net_weights
+    folders = os.listdir(net_weights)
+
+    # filter out empty folders
+    folders = [f for f in folders if len(os.listdir(os.path.join(net_weights, f)))]
+    if len(folders) == 0:
+        return ''
+
+    # sort folders by folder created time
+    folders = sorted(folders, key=lambda f: datetime.datetime.strptime(f, fmt))
+    return folders[-1]
+
+def most_recent_weights(weights_folder):
+    """
+        return most recent created weights file
+        if folder is empty return empty string
+    """
+    weight_files = os.listdir(weights_folder)
+    if len(weights_folder) == 0:
+        return ''
+
+    regex_str = r'([A-Za-z0-9]+)-([0-9]+)-(regular|best)'
+
+    # sort files by epoch
+    weight_files = sorted(weight_files, key=lambda w: int(re.search(regex_str, w).groups()[1]))
+
+    return weight_files[-1]
+
+def last_epoch(weights_folder):
+    weight_file = most_recent_weights(weights_folder)
+    if not weight_file:
+       raise Exception('no recent weights were found')
+    resume_epoch = int(weight_file.split('-')[1])
+
+    return resume_epoch
+
+def best_acc_weights(weights_folder):
+    """
+        return the best acc .pth file in given folder, if no
+        best acc weights file were found, return empty string
+    """
+    files = os.listdir(weights_folder)
+    if len(files) == 0:
+        return ''
+
+    regex_str = r'([A-Za-z0-9]+)-([0-9]+)-(regular|best)'
+    best_files = [w for w in files if re.search(regex_str, w).groups()[2] == 'best']
+    if len(best_files) == 0:
+        return ''
+
+    best_files = sorted(best_files, key=lambda w: int(re.search(regex_str, w).groups()[1]))
+    return best_files[-1]
+
+
+        
+  
+
+
+
 if __name__ == "__main__":
     #---------------------------------#
     #   Cuda    是否使用Cuda
     #           没有GPU可以设置成False
     #---------------------------------#
     Cuda            = True
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--net', type=str, required=True, help='net type')
+    parser.add_argument('--gpu', action='store_true', default=False, help='use gpu or not')
+    parser.add_argument('-b', type=int, default=128, help='batch size for dataloader')
+    parser.add_argument('--epoch', type=int, default=100, help='num of epochs to train')
+    parser.add_argument('--warm', type=int, default=1, help='warm up training phase')
+    parser.add_argument('--lr', type=float, default=0.1, help='initial learning rate')
+    parser.add_argument('--resume', action='store_true', default=False, help='resume training')
+    parser.add_argument('--profiling', action="store_true", default=False, help="profile one batch")
+    args = parser.parse_args()
+
+    DATE_FORMAT = '%A_%d_%B_%Y_%Hh_%Mm_%Ss'
+
+    CHECKPOINT_PATH = 'output/checkpoint/'
+
+    TIME_NOW = datetime.now().strftime(DATE_FORMAT)
+    #prepare folder
+    cmd = 'mkdir -p ' + os.path.join(CHECKPOINT_PATH, args.net)
+    #python 2.7 & 3
+    ret = subprocess.check_output(cmd, shell=True)
+    
+    os.makedirs(os.path.join("logs", args.net), exist_ok=True)
+    csv_path = os.path.join("logs", args.net, f"{TIME_NOW}.csv")
+    csv_writer = open(csv_path, "w")
+    csv_writer.write("epoch,iteration,trained_samples,total_samples,loss,lr,current epoch wall-clock time\n")
+       
+    data_path = "VOCdevkit"
+    if not os.path.exists("VOCdevkit"):
+        voc_train = datasets.VOCDetection(data_path, year="2012", image_set="trainval", download= "True")
+
+    if not os.path.exists("2012_train.txt"):
+        print("生成中...")
+        os.system("ar -xvf ./VOCdevkit/VOCtrainval_11-May-2012.tar")
+        os.system("python voc_annotation.py")
+
     #---------------------------------------------------------------------#
     #   distributed     用于指定是否使用单机多卡分布式运行
     #                   终端指令仅支持Ubuntu。CUDA_VISIBLE_DEVICES用于在Ubuntu下指定显卡。
@@ -92,7 +206,7 @@ if __name__ == "__main__":
     #   一般来讲，网络从0开始的训练效果会很差，因为权值太过随机，特征提取效果不明显，因此非常、非常、非常不建议大家从0开始训练！
     #   如果一定要从0开始，可以了解imagenet数据集，首先训练分类模型，获得网络的主干部分权值，分类模型的 主干部分 和该模型通用，基于此进行训练。
     #----------------------------------------------------------------------------------------------------------------------------#
-    model_path      = 'model_data/yolo_weights.pth'
+    model_path      = ''
     #------------------------------------------------------#
     #   input_shape     输入的shape大小，一定要是32的倍数
     #------------------------------------------------------#
@@ -159,12 +273,12 @@ if __name__ == "__main__":
     #   Unfreeze_batch_size     模型在解冻后的batch_size
     #------------------------------------------------------------------#
     UnFreeze_Epoch      = 300
-    Unfreeze_batch_size = 8
+    Unfreeze_batch_size = args.b
     #------------------------------------------------------------------#
     #   Freeze_Train    是否进行冻结训练
     #                   默认先冻结主干训练后解冻训练。
     #------------------------------------------------------------------#
-    Freeze_Train        = True
+    Freeze_Train        = False
 
     #------------------------------------------------------------------#
     #   其它训练参数：学习率、优化器、学习率下降有关
@@ -173,7 +287,7 @@ if __name__ == "__main__":
     #   Init_lr         模型的最大学习率
     #   Min_lr          模型的最小学习率，默认为最大学习率的0.01
     #------------------------------------------------------------------#
-    Init_lr             = 1e-2
+    Init_lr             = args.lr
     Min_lr              = Init_lr * 0.01
     #------------------------------------------------------------------#
     #   optimizer_type  使用到的优化器种类，可选的有adam、sgd
@@ -193,11 +307,11 @@ if __name__ == "__main__":
     #------------------------------------------------------------------#
     #   save_period     多少个epoch保存一次权值
     #------------------------------------------------------------------#
-    save_period         = 10
+    save_period         = 5
     #------------------------------------------------------------------#
     #   save_dir        权值与日志文件保存的文件夹
     #------------------------------------------------------------------#
-    save_dir            = 'logs'
+    save_dir            = 'output'
     #------------------------------------------------------------------#
     #   eval_flag       是否在训练时进行评估，评估对象为验证集
     #                   安装pycocotools库后，评估体验更佳。
@@ -207,20 +321,20 @@ if __name__ == "__main__":
     #   （一）此处获得的mAP为验证集的mAP。
     #   （二）此处设置评估参数较为保守，目的是加快评估速度。
     #------------------------------------------------------------------#
-    eval_flag           = True
-    eval_period         = 10
+    eval_flag           = False
+    eval_period         = 20
     #------------------------------------------------------------------#
     #   num_workers     用于设置是否使用多线程读取数据
     #                   开启后会加快数据读取速度，但是会占用更多内存
     #                   内存较小的电脑可以设置为2或者0  
     #------------------------------------------------------------------#
-    num_workers         = 4
+    num_workers         = 2
 
     #----------------------------------------------------#
     #   获得图片路径和标签
     #----------------------------------------------------#
-    train_annotation_path   = '2007_train.txt'
-    val_annotation_path     = '2007_val.txt'
+    train_annotation_path   = '2012_train.txt'
+    val_annotation_path     = '2012_val.txt'
 
     #------------------------------------------------------#
     #   设置用到的显卡
@@ -248,6 +362,11 @@ if __name__ == "__main__":
     #   创建yolo模型
     #------------------------------------------------------#
     model = YoloBody(anchors_mask, num_classes, pretrained=pretrained)
+
+    MINOVERLAP      = 0.5
+
+    score_threhold  = 0.5
+
     if not pretrained:
         weights_init(model)
     if model_path != '':
@@ -287,7 +406,7 @@ if __name__ == "__main__":
     #   记录Loss
     #----------------------#
     if local_rank == 0:
-        time_str        = datetime.datetime.strftime(datetime.datetime.now(),'%Y_%m_%d_%H_%M_%S')
+        time_str        = datetime.strftime(datetime.now(),'%Y_%m_%d_%H_%M_%S')
         log_dir         = os.path.join(save_dir, "loss_" + str(time_str))
         loss_history    = LossHistory(log_dir, model, input_shape=input_shape)
     else:
@@ -324,6 +443,7 @@ if __name__ == "__main__":
             cudnn.benchmark = True
             model_train = model_train.cuda()
 
+
     #---------------------------#
     #   读取数据集对应的txt
     #---------------------------#
@@ -356,7 +476,31 @@ if __name__ == "__main__":
             print("\n\033[1;33;44m[Warning] 使用%s优化器时，建议将训练总步长设置到%d以上。\033[0m"%(optimizer_type, wanted_step))
             print("\033[1;33;44m[Warning] 本次运行的总训练数据量为%d，Unfreeze_batch_size为%d，共训练%d个Epoch，计算出总训练步长为%d。\033[0m"%(num_train, Unfreeze_batch_size, UnFreeze_Epoch, total_step))
             print("\033[1;33;44m[Warning] 由于总训练步长为%d，小于建议总步长%d，建议设置总世代为%d。\033[0m"%(total_step, wanted_step, wanted_epoch))
-
+    
+    best_acc = 0.0
+    # if args.resume:
+    recent_folder = most_recent_folder(os.path.join(CHECKPOINT_PATH, args.net), fmt=DATE_FORMAT)
+    if True:
+        resume_epoch = 0
+        checkpoint_path = os.path.join(CHECKPOINT_PATH, args.net, TIME_NOW)
+    else:
+        resume_epoch = last_epoch(os.path.join(CHECKPOINT_PATH, args.net, recent_folder))
+        best_weights = best_acc_weights(os.path.join(CHECKPOINT_PATH, args.net, recent_folder))
+        if best_weights:
+            weights_path = os.path.join(CHECKPOINT_PATH, args.net, recent_folder, best_weights)
+            logging.info('found best acc weights file:{}'.format(weights_path))
+            logging.info('load best training file to test acc...')
+            model.load_state_dict(torch.load(weights_path))
+            best_acc = get_map(MINOVERLAP, True, score_threhold = score_threhold, path = save_dir)
+            logging.info('best acc is {:0.2f}'.format(best_acc))
+        recent_weights_file = most_recent_weights(os.path.join(CHECKPOINT_PATH, args.net, recent_folder))
+        if not recent_weights_file:
+            raise Exception('no recent weights file were found')
+        weights_path = os.path.join(CHECKPOINT_PATH, args.net, recent_folder, recent_weights_file)
+        logging.info('loading weights file {} to resume training.....'.format(weights_path))
+        model.load_state_dict(torch.load(weights_path))
+        
+        checkpoint_path = os.path.join(CHECKPOINT_PATH, args.net, recent_folder)
     #------------------------------------------------------#
     #   主干特征提取网络特征通用，冻结训练可以加快训练速度
     #   也可以在训练初期防止权值被破坏。
@@ -436,11 +580,12 @@ if __name__ == "__main__":
             val_sampler     = None
             shuffle         = True
 
-        gen             = DataLoader(train_dataset, shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=True,
+        gen             = DataLoader(train_dataset, shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=False,
                                     drop_last=True, collate_fn=yolo_dataset_collate, sampler=train_sampler)
-        gen_val         = DataLoader(val_dataset  , shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=True, 
+        gen_val         = DataLoader(val_dataset  , shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=False, 
                                     drop_last=True, collate_fn=yolo_dataset_collate, sampler=val_sampler)
-
+        MILESTONES = [60, 120, 160]
+        train_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=MILESTONES, gamma=0.2)
         #----------------------#
         #   记录eval的map曲线
         #----------------------#
@@ -449,58 +594,228 @@ if __name__ == "__main__":
                                             eval_flag=eval_flag, period=eval_period)
         else:
             eval_callback   = None
-        
-        #---------------------------------------#
-        #   开始模型训练
-        #---------------------------------------#
-        for epoch in range(Init_Epoch, UnFreeze_Epoch):
-            #---------------------------------------#
-            #   如果模型有冻结学习部分
-            #   则解冻，并设置参数
-            #---------------------------------------#
-            if epoch >= Freeze_Epoch and not UnFreeze_flag and Freeze_Train:
-                batch_size = Unfreeze_batch_size
+        ''' 
+    
+        '''
+        for epoch in range(1, args.epoch + 1):
+            if epoch > args.warm:
+                train_scheduler.step(epoch)
 
-                #-------------------------------------------------------------------#
-                #   判断当前batch_size，自适应调整学习率
-                #-------------------------------------------------------------------#
-                nbs             = 64
-                lr_limit_max    = 1e-3 if optimizer_type == 'adam' else 5e-2
-                lr_limit_min    = 3e-4 if optimizer_type == 'adam' else 5e-4
-                Init_lr_fit     = min(max(batch_size / nbs * Init_lr, lr_limit_min), lr_limit_max)
-                Min_lr_fit      = min(max(batch_size / nbs * Min_lr, lr_limit_min * 1e-2), lr_limit_max * 1e-2)
+            # if args.resume:
+            if epoch <= resume_epoch:
+                continue
+
+            start = time.time()
+            epoch_start_time = time.time()
+            #---------------------------------------#
+                #   开始模型训练
                 #---------------------------------------#
-                #   获得学习率下降的公式
+            for epoch in range(1, UnFreeze_Epoch):
                 #---------------------------------------#
-                lr_scheduler_func = get_lr_scheduler(lr_decay_type, Init_lr_fit, Min_lr_fit, UnFreeze_Epoch)
+                #   如果模型有冻结学习部分
+                #   则解冻，并设置参数
+                #---------------------------------------#
                 
-                for param in model.backbone.parameters():
-                    param.requires_grad = True
+                if epoch >= Freeze_Epoch and not UnFreeze_flag and Freeze_Train:
+                    batch_size = Unfreeze_batch_size
 
-                epoch_step      = num_train // batch_size
-                epoch_step_val  = num_val // batch_size
-
-                if epoch_step == 0 or epoch_step_val == 0:
-                    raise ValueError("数据集过小，无法继续进行训练，请扩充数据集。")
-
-                if distributed:
-                    batch_size = batch_size // ngpus_per_node
+                    #-------------------------------------------------------------------#
+                    #   判断当前batch_size，自适应调整学习率
+                    #-------------------------------------------------------------------#
+                    nbs             = 64
+                    lr_limit_max    = 1e-3 if optimizer_type == 'adam' else 5e-2
+                    lr_limit_min    = 3e-4 if optimizer_type == 'adam' else 5e-4
+                    Init_lr_fit     = min(max(batch_size / nbs * Init_lr, lr_limit_min), lr_limit_max)
+                    Min_lr_fit      = min(max(batch_size / nbs * Min_lr, lr_limit_min * 1e-2), lr_limit_max * 1e-2)
+                    #---------------------------------------#
+                    #   获得学习率下降的公式
+                    #---------------------------------------#
+                    lr_scheduler_func = get_lr_scheduler(lr_decay_type, Init_lr_fit, Min_lr_fit, UnFreeze_Epoch)
                     
-                gen             = DataLoader(train_dataset, shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=True,
-                                            drop_last=True, collate_fn=yolo_dataset_collate, sampler=train_sampler)
-                gen_val         = DataLoader(val_dataset  , shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=True, 
-                                            drop_last=True, collate_fn=yolo_dataset_collate, sampler=val_sampler)
+                    for param in model.backbone.parameters():
+                        param.requires_grad = True
 
-                UnFreeze_flag = True
-                
-            if distributed:
-                train_sampler.set_epoch(epoch)
-            set_optimizer_lr(optimizer, lr_scheduler_func, epoch)
+                    epoch_step      = num_train // batch_size
+                    epoch_step_val  = num_val // batch_size
 
-            fit_one_epoch(model_train, model, yolo_loss, loss_history, eval_callback, optimizer, epoch, epoch_step, epoch_step_val, gen, gen_val, UnFreeze_Epoch, Cuda, fp16, scaler, save_period, save_dir, local_rank)
+                    if epoch_step == 0 or epoch_step_val == 0:
+                        raise ValueError("数据集过小，无法继续进行训练，请扩充数据集。")
+
+                    if distributed:
+                        batch_size = batch_size // ngpus_per_node
                         
-            if distributed:
-                dist.barrier()
+                    gen             = DataLoader(train_dataset, shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=False,
+                                                drop_last=True, collate_fn=yolo_dataset_collate, sampler=train_sampler)
+                    gen_val         = DataLoader(val_dataset  , shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=False, 
+                                                drop_last=True, collate_fn=yolo_dataset_collate, sampler=val_sampler)
+
+                    UnFreeze_flag = True
+                    
+                if distributed:
+                    train_sampler.set_epoch(epoch)
+                set_optimizer_lr(optimizer, lr_scheduler_func, epoch)
+
+            
+                loss        = 0
+                val_loss    = 0
+
+                if local_rank == 0:
+                    print('Start Train')
+                    pbar = tqdm(total=epoch_step,desc=f'Epoch {epoch}/{UnFreeze_Epoch}',postfix=dict,mininterval=0.3)
+                model_train.train()
+                for iteration, batch in enumerate(gen):
+                    if iteration >= epoch_step:
+                        break
+
+                    images, targets = batch[0], batch[1]
+                    with torch.no_grad():
+                        if Cuda:
+                            images  = images.cuda(local_rank)
+                            targets = [ann.cuda(local_rank) for ann in targets]
+            #----------------------#
+            #   清零梯度
+            #----------------------#
+                    optimizer.zero_grad()
+                    if not fp16:
+                #----------------------#
+                #   前向传播
+                #----------------------#
+                        outputs         = model_train(images)
+
+                        loss_value_all  = 0
+                #----------------------#
+                #   计算损失
+                #----------------------#
+                        for l in range(len(outputs)):
+                            loss_item = yolo_loss(l, outputs[l], targets)
+                            loss_value_all  += loss_item
+                        loss_value = loss_value_all
+
+                #----------------------#
+                #   反向传播
+                #----------------------#
+                        loss_value.backward()
+                        optimizer.step()
+                    else:
+                        from torch.cuda.amp import autocast
+                        with autocast():
+                    #----------------------#
+                    #   前向传播
+                    #----------------------#
+                            outputs         = model_train(images)
+
+                            loss_value_all  = 0
+                    #----------------------#
+                    #   计算损失
+                    #----------------------#
+                            for l in range(len(outputs)):
+                                loss_item = yolo_loss(l, outputs[l], targets)
+                                loss_value_all  += loss_item
+                            loss_value = loss_value_all
+
+                #----------------------#
+                #   反向传播
+                #----------------------#
+                        scaler.scale(loss_value).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+
+                    loss += loss_value.item()
+            
+                    if local_rank == 0:
+                        pbar.set_postfix(**{'loss'  : loss / (iteration + 1), 
+                                            'lr'    : get_lr(optimizer)})
+                        pbar.update(1)
+
+                if local_rank == 0:
+                    pbar.close()
+                    print('Finish Train')
+                    print('Start Validation')
+                    pbar = tqdm(total=epoch_step_val, desc=f'Epoch {epoch + 1}/{UnFreeze_Epoch}',postfix=dict,mininterval=0.3)
+
+                model_train.eval()
+                for iteration, batch in enumerate(gen_val):
+                    if iteration >= epoch_step_val:
+                        break
+                    images, targets = batch[0], batch[1]
+                    with torch.no_grad():
+                        if Cuda:
+                            images  = images.cuda(local_rank)
+                            targets = [ann.cuda(local_rank) for ann in targets]
+                #----------------------#
+                #   清零梯度
+                #----------------------#
+                        optimizer.zero_grad()
+                #----------------------#
+                #   前向传播
+                #----------------------#
+                        outputs         = model_train(images)
+
+                        loss_value_all  = 0
+                #----------------------#
+                #   计算损失
+                #----------------------#
+                        for l in range(len(outputs)):
+                            loss_item = yolo_loss(l, outputs[l], targets)
+                            loss_value_all  += loss_item
+                        loss_value  = loss_value_all
+
+                    val_loss += loss_value.item()
+                    if local_rank == 0:
+                        pbar.set_postfix(**{'val_loss': val_loss / (iteration + 1)})
+                        pbar.update(1)
+
+                if local_rank == 0:
+                    pbar.close()
+                    print('Finish Validation')
+                    loss_history.append_loss(epoch + 1, loss / epoch_step, val_loss / epoch_step_val)
+                    eval_callback.on_epoch_end(epoch + 1, model_train)
+                    print('Epoch:'+ str(epoch + 1) + '/' + str(UnFreeze_Epoch))
+                    print('Total Loss: %.3f || Val Loss: %.3f ' % (loss / epoch_step, val_loss / epoch_step_val))
+            
+            #-----------------------------------------------#
+            #   保存权值
+            #-----------------------------------------------#
+                if (epoch + 1) % save_period == 0 or epoch + 1 == UnFreeze_Epoch:
+                    torch.save(model.state_dict(), os.path.join(save_dir, "ep%03d-loss%.3f-val_loss%.3f.pth" % (epoch + 1, loss / epoch_step, val_loss / epoch_step_val)))
+
+                if len(loss_history.val_loss) <= 1 or (val_loss / epoch_step_val) <= min(loss_history.val_loss):
+                    print('Save best model to best_epoch_weights.pth')
+                    torch.save(model.state_dict(), os.path.join(save_dir, "best_epoch_weights.pth"))
+                
+                torch.save(model.state_dict(), os.path.join(save_dir, "last_epoch_weights.pth"))
+                    # in the end of one iteration
+                csv_writer.write("{},{},{},{},{},{},{}".format(
+                epoch,                                  # epoch
+                iteration,                              # iteration
+                epoch * batch_size + len(images),       # trained_samples
+                num_train,                              # total_samples
+                yolo_loss,                              # loss
+                get_lr(optimizer),                      # lr
+                time.time() - epoch_start_time,         # current epoch wall-clock time
+                ))
+
+                logging.info("epoch = {}, iteration = {}, trained_samples = {}, total_samples = {}, loss = {}, lr = {}, current_epoch_wall-clock_time = {}".format(
+                epoch,                                  # epoch
+                iteration,                              # iteration
+                epoch * batch_size + len(images),       # trained_samples
+                num_train,                              # total_samples
+                yolo_loss,                              # loss
+                get_lr(optimizer),                      # lr
+                time.time() - epoch_start_time,         # current epoch wall-clock time
+                ))
+
+                if args.profiling:
+                    logging.info(f"PROFILING: dataset total number {num_train}, training one batch costs {time.time() - epoch_start_time} seconds")
+                    break      
+                    
+           
+
+         
+
+            
+
+            
 
         if local_rank == 0:
             loss_history.writer.close()
